@@ -63,20 +63,24 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
 
-    // TODO: review
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
+    // 定义一个block计算shape大小，以及是用几个wrap进行计算
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
         Tile<Int<16 * kNWarps>, _16, _16>>;
 
+    // 定义smem一个原子基本块shape是(8, 32)或者(8, 64)
+    // (8, 32)或者(8, 64)取决于kSwizzle，保证 2^kSwizzle * 2^3 = 32/64
     using SmemLayoutAtom = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
                     Layout<Shape<_8, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+    
+    // 将atom原子基本块进行平铺得到完整形状
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtom{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
@@ -120,6 +124,8 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
     static_assert(kNThreads % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
+
+    // GmemLayoutAtom 主要将所有线程按照wrap进行划分
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
 
@@ -130,6 +136,11 @@ struct Flash_fwd_kernel_traits : public Base {
         SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
         DefaultCopy
     >;
+
+    // make_tiled_copy
+    // args1: 数据搬运模式
+    // args2: 所有线程按照维度切分
+    // args3: 单线程操作元素个数
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},

@@ -439,7 +439,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);                 // (MMA,MMA_K,MMA_N)
 
   // NOTE: 准备拷贝Q, K 到 reg 的copy对象 (smem --> reg)
-
   // define 
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);

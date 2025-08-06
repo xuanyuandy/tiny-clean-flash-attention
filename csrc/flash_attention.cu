@@ -376,8 +376,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   const int bs_head_offset = base_id * params.head_stride;
 
-  // TODO: base offset for MHA
-  // NOTE: convert C pointer to Tensor for convenience
+  // define the global tensor of Q/K/V/O
   Tensor Q = make_tensor(
       make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + bs_head_offset),
       make_shape(params.q_seqlen, Int<kHeadDim>{}),
@@ -395,21 +394,17 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
       make_shape(params.q_seqlen, Int<kHeadDim>{}),
       make_stride(Int<kHeadDim>{}, Int<1>{}));
 
-
-  // 加载Q, K, V分块
-  // (kBlockM, kHeadDim, num_tile_n)
+  
+  // define the single block of global tensor Q(only need once)
+  // the dim of gQ is (blockIdx.x, blockIdx.y, kBlockM, kHeadDim)
   Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
 
-  // (kBlockN, kHeadDim, num_tile_n)
-  // NOTE: loading流水线, 初次加载所需K, V
+  // define the single block of global tensor K/V(only need once)
+  // preload the first position of gK/gV block
   Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
   Tensor gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
 
-  // 获取MMA抽象
-  TiledMMA tiled_mma;
-  auto thr_mma = tiled_mma.get_slice(tidx);
-
-  // Construct SMEM tensors.
+  // construct smem tensors of Q/K/V
   Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
   Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
   Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
@@ -418,12 +413,13 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
   Tensor sVtNoSwizzle = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVtNswizzle{});
 
-  // NOTE: copy抽象
-  // NOTE: QKV gmem -> smem 拷贝的抽象
+  // define QKV gmem -> smem copy operation
+  // gmem_tiled_copy_QKV use whole thread(kNWarps * 32) to copy elements, each thread copy 8 elements
+  // when KNWraps = 4, gmem_tiled_copy_QKV copy 1024 elements at once
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
-  auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
-  // NOTE: 定义gmem -> smem拷贝的src, dst
+  // define the src/dst tensor of each thread
+  auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
   Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
@@ -433,11 +429,18 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // NOTE: 定义smem -> reg 拷贝的dst
   // partition_fragment与partition类似, 只是返回的是寄存器表示
+
+  // define the reg data format of Q/K/Output
+  // reg format of smem
+  TiledMMA tiled_mma;
+  auto thr_mma = tiled_mma.get_slice(tidx);
   Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
   Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
-  Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                         // (MMA, MMA_K,MMA_N)
+  Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);                 // (MMA,MMA_K,MMA_N)
 
   // NOTE: 准备拷贝Q, K 到 reg 的copy对象 (smem --> reg)
+
+  // define 
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
@@ -458,11 +461,10 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // tKsK表示smem中的K, 用作gmem->smem的dst
   // tSsK表示smem中的K, 用作smem->reg的src
 
-  // 流水线加载初始Q, K
-  // 加载Q到smem
+  // load q/k from gmem -> smem
   flash::copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
-  // 加载K到smem
   flash::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
+  
   // 开始执行异步拷贝
   cute::cp_async_fence();
 
@@ -611,6 +613,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
   using SmemLayoutK = typename Kernel_traits::SmemLayoutKV;
   using SmemLayoutV = typename Kernel_traits::SmemLayoutKV;
 
+  // single block_num of q_seqlen is q_seqlen divided by 64
+  // each block owns KNThreads
   const int num_m_block =
       (params.q_seqlen + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
 

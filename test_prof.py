@@ -1,3 +1,4 @@
+# nsys profile -t cuda,nvtx python3 test_prof.py
 import torch
 import math
 from attention_cutlass import flash_attention_v2_cutlass

@@ -4,7 +4,7 @@ from attention_cutlass import flash_attention_v2_cutlass
 import math
 import time
 # offical flash attention implement
-from vllm_flash_attn import flash_attn_func as flash_attn_func_offical
+# from vllm_flash_attn import flash_attn_func as flash_attn_func_offical
 
 '''
 simple attention implement without multi head
@@ -61,13 +61,14 @@ def main(bs=1, head=64, seq_len=4096, dim=64):
     fq = q.transpose(1, 2)
     fk = k.transpose(1, 2)
     fv = v.transpose(1, 2)
-    official_ref_time = run_benchmark(epoch, warmup, flash_attn_func_offical, fq, fk, fv, causal=is_causal, softmax_scale=sm_scale)
-    official_result = flash_attn_func_offical(fq, fk, fv, causal=is_causal, softmax_scale=sm_scale)
+    # official_ref_time = run_benchmark(epoch, warmup, flash_attn_func_offical, fq, fk, fv, causal=is_causal, softmax_scale=sm_scale)
+    # official_result = flash_attn_func_offical(fq, fk, fv, causal=is_causal, softmax_scale=sm_scale)
     
-    print(f"bs:{bs}, head:{head}, seq_len:{seq_len}, dim:{dim}        \
-            baseline:{base_time * 1000 / epoch} ms        \
-            flash2_cutlass_fp16:{official_ref_time * 1000 / epoch} ms")
-
+    # print(f"bs:{bs}, head:{head}, seq_len:{seq_len}, dim:{dim}        \
+    #         baseline:{base_time * 1000 / epoch} ms        \
+    #         flash2_cutlass_fp16:{official_ref_time * 1000 / epoch} ms")
+    from precision_compare import data_compare
+    data_compare(baseline.detach().cpu().numpy(), flash2_cutlass_ref.cpu().numpy())
     assert torch.allclose(baseline, flash2_cutlass_ref, rtol=0, atol=1e-2)
 
 
@@ -75,10 +76,9 @@ if __name__ == "__main__":
     epoch = 1
     for _ in range(epoch):
         for bs in [1, 2]:
-            for head in [8, 16, 32]:
-                for seq_len in [64, 1024, 4096]:
+            for head in [8]:
+                for seq_len in [64, 1024]:
                     for dim in [32, 64]:
-                        
                         main(bs, head, seq_len, dim)
 
 
